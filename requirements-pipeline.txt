@@ -1,0 +1,18 @@
+-r requirements.txt
+# Dataset conversion (and the SMPL-X mesh views of the viewer). Needs an NVIDIA GPU with ~10 GB of memory.
+#
+# Install first, separately:
+#   1. PyTorch with CUDA, matching your driver (https://pytorch.org), e.g.
+#        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   2. PyTorch3D matching that torch / CUDA (see README.md and INSTALL_PYTORCH3D_WINDOWS.md)
+#   3. chumpy (reads the FLAME / SMPL-X model pickles):
+#        pip install chumpy --no-build-isolation
+#   4. ffmpeg and ffprobe on PATH (or set their folder in Settings)
+onnxruntime-gpu>=1.17
+ultralytics>=8.1
+huggingface_hub>=0.20
+omegaconf>=2.3
+timm>=0.9
+einops>=0.7
+PyYAML>=6
+scipy>=1.10
