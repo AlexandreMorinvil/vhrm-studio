@@ -121,6 +121,18 @@ vhrm-studio-convert --help                                                      
 - Rows target 30 fps: every frame of sources up to ~30 fps; an exact stride for (near) integer multiples of 30 with
   regular time stamps; otherwise the frame nearest each multiple of 1/30 s.
 
+### Person detection
+
+YOLO receives BGR images converted from the pipeline's RGB frames, with a person confidence threshold of 0.5.
+When a batch needs an initial or replacement person box, detection starts at its last frame and retries earlier
+frames if necessary. DeepLab refines the box on the detected seed frame, then the pipeline processes every
+original row of the batch in order, with its original source index and timestamp. A miss on the first frame
+therefore no longer discards the entire first batch (eight frames by default). Subsequent DeepLab box tracking
+and crop positioning are unchanged.
+
+Existing completed HDF5 files are not repaired automatically: select *Redo sources that are already converted*
+in the conversion window, or use `--overwrite` on the command line, to regenerate them.
+
 ## HDF5 layout
 
 | Dataset | Shape / dtype | Content |

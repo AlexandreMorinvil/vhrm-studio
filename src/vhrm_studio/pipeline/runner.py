@@ -158,7 +158,8 @@ class SkinUVPipeline:
         return self.backbone_run(x.contiguous())[:n]
 
     def detect_person_bbox(self, frame_rgb):
-        det = self.detector.predict(frame_rgb, device=str(self.device), classes=0, conf=YOLO_CONF, save=False,
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        det = self.detector.predict(frame_bgr, device=str(self.device), classes=0, conf=YOLO_CONF, save=False,
                                     verbose=False)[0]
         boxes = det.boxes.xyxy.detach().cpu().numpy()
         if len(boxes) < 1:
@@ -166,6 +167,18 @@ class SkinUVPipeline:
         areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
         b = boxes[int(np.argmax(areas))]
         return np.array([b[0], b[1], b[2] - b[0], b[3] - b[1]], dtype=np.float32)
+
+    def _detect_batch_person_bbox(self, frames):
+        """Return the latest detectable frame's bbox, its batch index and the number of YOLO calls."""
+        n = frames.shape[0]
+        if n < 1:
+            raise ValueError('cannot detect a person in an empty batch')
+        for index in range(n - 1, -1, -1):
+            frame_rgb = frames[index].permute(1, 2, 0).to(torch.uint8).contiguous().cpu().numpy()
+            bbox = self.detect_person_bbox(frame_rgb)
+            if bbox is not None:
+                return bbox, index, n - index
+        return None, None, n
 
     # ------------------------------------------------------------------ one source
     def run_video(self, source, h5_path, settings=None, progress=None, should_stop=None, extra_attrs=None):
@@ -353,7 +366,8 @@ class SkinUVPipeline:
                 'focal_length': FOCAL_LENGTH, 'render_size': RENDER_SIZE, 'raster_size': bp.raster_size,
                 'depth_tol_frac': bp.depth_tol_frac, 'fill_holes_px': FILL_HOLES_PX, 'bbox_ratio': BBOX_RATIO,
                 'person_bbox_pad': person_bbox_pad,
-                'bbox_initialization': 'YOLO seed refined by DeepLab before the first saved batch',
+                'bbox_initialization': 'YOLO seed from latest detectable batch frame, refined by DeepLab on that '
+                                       'frame before saving all original batch rows',
                 'yolo_conf': YOLO_CONF, 'batch_size': batch_size, 'float32_matmul_precision': 'highest',
                 'cihp_class_names': CLASS_NAMES, 'cihp_colormap': COLORMAP, 'skin_class_ids': SKIN_CLASS_IDS,
                 'skin_color_space': 'LAB (OpenCV 8-bit, from RGB)',
@@ -412,14 +426,13 @@ class SkinUVPipeline:
 
                     if bbox is None:
                         with timer('detect'):
-                            detected_bbox = self.detect_person_bbox(
-                                frames[0].permute(1, 2, 0).to(torch.uint8).contiguous().cpu().numpy())
-                            n_detect += 1
+                            detected_bbox, seed_index, detect_calls = self._detect_batch_person_bbox(frames)
+                            n_detect += detect_calls
                         temporal.bbox_filter.reset()
                         seed_bbox = None if detected_bbox is None else process_bbox(
                             bbox=detected_bbox.copy(), img_width=img_w, img_height=img_h,
                             input_img_shape=[C, C], ratio=BBOX_RATIO)
-                        if seed_bbox is not None:
+                        if seed_bbox is not None and seed_index is not None:
                             with timer('bbox_initialize'):
                                 seed_inv = gen_trans_from_patch_cv(
                                     float(seed_bbox[0] + 0.5 * seed_bbox[2]), float(seed_bbox[1] + 0.5 * seed_bbox[3]),
@@ -428,7 +441,8 @@ class SkinUVPipeline:
                                 deeplab.submit()
                                 seed_out = deeplab.result()
                                 person_bbox = bbox_from_class_ids(
-                                    seed_out['crop_class_ids'][0], seed_inv, img_w, img_h, pad=person_bbox_pad)
+                                    seed_out['crop_class_ids'][seed_index], seed_inv, img_w, img_h,
+                                    pad=person_bbox_pad)
                                 refiner.reset()
                             bbox = temporal.stabilize_bbox(
                                 detected_bbox if person_bbox is None else person_bbox, img_w, img_h, frame_times[0])
