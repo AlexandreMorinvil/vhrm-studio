@@ -14,10 +14,74 @@ on the same video it writes bit-identical datasets.
 
 ## Install
 
+Activate the intended Python environment first. Use that same interpreter for installing, checking and launching;
+`pip` on its own can install into a different environment.
+
 ```
-pip install -r requirements.txt        # viewer
-pip install -e .                       # optional: the vhrm-studio, vhrm-studio-gui and vhrm-studio-convert commands
+python -m pip install -r requirements.txt   # viewer, including PyAV (av)
+python -m pip install -e .                 # editable package and vhrm-studio commands
+python -m pip check
+python -c "import sys, av; from vhrm_studio import app; assert app.av is not None; print(sys.executable); print('PyAV', av.__version__)"
 ```
+
+**Do not skip the import check.** A successful install or `pip check` only checks package metadata, not whether
+native DLLs can load. PyAV is required for source-video panels and is independent of the ffmpeg/ffprobe executables
+used by dataset conversion. Stored HDF5 views and image-sequence sources can still work when PyAV cannot load.
+
+#### Windows / conda verification
+
+From the repository root in PowerShell, use an explicit interpreter (replace the path on another computer):
+
+```powershell
+$python = 'C:\Users\alexa\anaconda3\envs\vhrm-studio\python.exe'
+& $python -m pip install -r .\requirements.txt
+if ($LASTEXITCODE -ne 0) { throw 'Viewer dependency installation failed.' }
+& $python -m pip install -e .
+if ($LASTEXITCODE -ne 0) { throw 'Editable installation failed.' }
+& $python -m pip check
+if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed.' }
+& $python -c "import sys, av; from vhrm_studio import app; assert app.av is not None; print(sys.executable); print('PyAV', av.__version__)"
+if ($LASTEXITCODE -ne 0) { throw 'PyAV native import failed; resolve the reported error before launching.' }
+```
+
+Also check actual source-video decoding and seeking before considering a viewer installation complete:
+
+```powershell
+$video = 'C:\dataset\subject1\vid.avi'  # replace with an existing source video
+@'
+import sys
+from vhrm_studio.app import VideoSource
+source = VideoSource(sys.argv[1], {})
+try:
+    for timestamp in (0.0, 0.1):
+        image = source.frame_at(timestamp)
+        assert image.ndim == 3 and image.shape[2] == 3
+finally:
+    source.close()
+print('Source-video decode/seek OK')
+'@ | & $python - $video
+if ($LASTEXITCODE -ne 0) { throw 'Source-video decoding failed.' }
+```
+
+Then launch with `& $python -m vhrm_studio`. If Windows blocks the generated console launchers, use this module
+entry point; it does not require changing the security policy.
+
+#### PyAV import / Windows Application Control errors
+
+If PyAV is installed but importing it fails with `DLL load failed` or an Application Control/signing-policy error,
+installing `av` again is not necessarily a fix. On this computer, Windows Code Integrity blocked PyAV 19.0.1
+`av\video\frame.pyd` and `av\container\pyio.pyd` even though its package metadata was present. Fresh processes later
+passed import, COHFACE decoding/seeking and MP4 export checks without reinstalling PyAV; the already-running viewer
+still retained its earlier failed import.
+
+- Run the import check above in the exact interpreter used to launch the viewer, and keep the full exception.
+- For a missing package, install the viewer requirements in that interpreter. For a DLL failure, check native
+  runtime dependencies; for a policy block, inspect *Event Viewer > Applications and Services Logs > Microsoft >
+  Windows > CodeIntegrity > Operational* and obtain an administrator-approved package or policy authorization.
+  Do not disable Application Control or rename/move binaries to evade it.
+- **Fully close and restart the viewer after the check passes.** Its PyAV availability is determined at startup.
+- Do not blindly replace pip's PyAV with a conda build in an existing GPU environment: review the solver plan
+  first and preserve `numpy<2` and the working PyTorch/CUDA versions.
 
 ### Dataset conversion (and mesh views)
 
@@ -115,6 +179,10 @@ vhrm-studio-convert --help                                                      
 - Videos are decoded by ffmpeg into NV12 (NVDEC when the codec supports it) and converted on the GPU with the
   stream's colour matrix and range, as in the notebook. Videos stored as RGB (e.g. UBFC-rPPG's uncompressed
   `bgr24` AVI files) are piped as RGB instead, so that their colours are not chroma-subsampled.
+- Video time stamps normally come from container packet presentation times. When those are missing (e.g.
+  COHFACE's AVI files), FFprobe decodes the video to recover best-effort presentation times in frame order;
+  this slower probe is logged. No nominal-fps timestamps are substituted, and `source_timestamp_source` records
+  which probe was used.
 - Image sequences are read with OpenCV (8/16-bit, grey, BGR(A)). Their time stamps come from the last number of the
   file names when it is a time stamp in ns, us or ms (PURE), from frame numbers in the names, or from the
   *Image sequence fps* setting; the HDF5 attribute `source_timestamp_source` records which.

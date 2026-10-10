@@ -6,8 +6,8 @@
 
 Browse a folder of HDF5 files, step through or play the rows of one file and show any mix of the stored UV / crop
 products, the source video or image sequence (when it can be found) and the SMPL-X mesh rebuilt from the stored PEAR
-parameters. Requirements: PySide6, pyqtgraph, h5py, numpy, opencv. Optional: av (source video, MP4 export),
-torch + pytorch3d + the SMPL-X / FLAME assets (mesh views, loaded on demand; also needed for the conversion).
+parameters. Requirements: PySide6, pyqtgraph, h5py, numpy, opencv, av (source video, MP4 export).
+Optional: torch + pytorch3d + the SMPL-X / FLAME assets (mesh views, loaded on demand; also needed for conversion).
 
 Keys: Space play/pause, Left/Right step, Shift+Left/Right 10 rows, Home/End, I/O in/out marks, Ctrl+I clear marks,
 PgUp/PgDn previous/next file, F fit all panels, Ctrl+S snapshot, Ctrl+E export video.
@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 import zlib
 from collections import OrderedDict
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
@@ -37,10 +38,29 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 import pyqtgraph as pg
 
+_AV_IMPORT_ERROR = None
 try:
     import av
-except ImportError:
+except ImportError as exc:
     av = None
+    _AV_IMPORT_ERROR = exc
+
+
+def _pyav_error_message():
+    missing = isinstance(_AV_IMPORT_ERROR, ModuleNotFoundError) and _AV_IMPORT_ERROR.name == 'av'
+    status = 'PyAV is not installed' if missing else 'PyAV could not be imported'
+    reason = (f'{type(_AV_IMPORT_ERROR).__name__}: {_AV_IMPORT_ERROR}'
+              if _AV_IMPORT_ERROR is not None else 'av is unavailable in this process')
+    diagnostic = f'"{sys.executable}" -c "import av"'
+    repair = (f'Install into this interpreter: "{sys.executable}" -m pip install av.'
+              if missing else 'Check native-library dependencies and Windows Application Control/signing policy. '
+              'A policy block needs an administrator-approved package, not just pip install av.')
+    return (f'{status}: {reason}\nPython: {sys.executable}\nCheck: {diagnostic}\n{repair} '
+            'Restart the viewer after the import check succeeds.')
+
+
+if av is None:
+    warnings.warn(_pyav_error_message(), RuntimeWarning)
 
 STATUS_TEXT = {0: 'not processed', 1: 'ok', 2: 'no person detected', 3: 'invalid crop'}
 DEFAULT_CLASS_NAMES = [
@@ -430,7 +450,7 @@ class VideoSource:
 
     def __init__(self, path, attrs, scale=0.5):
         if av is None:
-            raise RuntimeError('PyAV is not installed (pip install av)')
+            raise RuntimeError(_pyav_error_message()) from _AV_IMPORT_ERROR
         self.path = Path(path)
         self.container = av.open(str(self.path))
         self.stream = self.container.streams.video[0]
@@ -996,7 +1016,7 @@ class Session(QtCore.QObject):
         images = self.src.attrs.get('source_type') == 'images'
         kind = 'images' if images else 'video'
         if av is None and not images:
-            self.video_error = 'PyAV is not installed: no source video (pip install av)'
+            self.video_error = f'{_pyav_error_message()}\nSource video is unavailable.'
         elif self.video_path is None:
             self.video_error = (f'source {kind} not found: {self.src.attrs.get("source_video_path", "?")} '
                                 '(Locate source)')
@@ -1654,6 +1674,9 @@ class Mp4Writer:
         self.size = (width, height)
         self.container = self.stream = self.cv = None
         rate = Fraction(fps).limit_denominator(1001)
+        if av is None:
+            warnings.warn(f'{_pyav_error_message()}\nMP4 export will use the OpenCV mp4v fallback.',
+                          RuntimeWarning, stacklevel=2)
         if av is not None:
             for codec, options in (('libx264', {'crf': '18', 'preset': 'medium'}), ('h264_mf', {}),
                                    ('mpeg4', {'qscale': '3'})):

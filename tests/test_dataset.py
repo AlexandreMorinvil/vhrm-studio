@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault('MKL_THREADING_LAYER', 'SEQUENTIAL')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
@@ -30,6 +32,79 @@ def fake_output(path, rows=4):
     with h5py.File(path, 'w') as f:
         f.create_dataset('frame_status', data=np.ones(rows, np.uint8))
         f.attrs.update({'saved_frame_count': rows, 'effective_fps': 30.0, 'frame_selection_mode': 'all'})
+
+
+class VideoTimestampTests(unittest.TestCase):
+    def test_packet_timestamps_keep_fast_path_and_skip_discarded_packets(self):
+        with mock.patch.object(frames, 'find_tool', return_value='ffprobe'), \
+                mock.patch.object(frames.subprocess, 'run', return_value=SimpleNamespace(
+                    stdout='0.100000,__\nN/A,_D\n\n0.000000,K_\n0.050000,__\n')) as run:
+            np.testing.assert_array_equal(frames.probe_frame_timestamps(Path('video.mp4')), [0.0, 0.05, 0.1])
+        run.assert_called_once()
+        self.assertIn('packet=pts_time,flags', run.call_args.args[0])
+
+    def test_missing_packet_timestamps_use_decoded_frames_without_time_shift(self):
+        decoded = {'frames': [{'best_effort_timestamp_time': str(t)} for t in (0.0, 0.05, 0.1)]}
+        for missing in ('N/A', ''):
+            with self.subTest(missing=missing), \
+                    mock.patch.object(frames, 'find_tool', return_value='ffprobe'), \
+                    mock.patch.object(frames.subprocess, 'run', side_effect=[
+                        SimpleNamespace(stdout=f'0.050000,K_\n{missing},__\n'),
+                        SimpleNamespace(stdout=json.dumps(decoded)),
+                    ]) as run, self.assertWarnsRegex(RuntimeWarning, 'probing decoded-frame'):
+                timestamps = frames.probe_frame_timestamps(Path('video.avi'))
+                np.testing.assert_array_equal(timestamps, [0.0, 0.05, 0.1])
+                self.assertEqual(run.call_count, 2)
+                self.assertIn('frame=best_effort_timestamp_time', run.call_args.args[0])
+                self.assertNotIn('+genpts', run.call_args.args[0])
+
+    def test_decoded_frame_timestamps_must_be_present_finite_and_ordered(self):
+        invalid_frames = [
+            [{}],
+            [{'best_effort_timestamp_time': 'N/A'}],
+            [{'best_effort_timestamp_time': 'nan'}],
+            [{'best_effort_timestamp_time': 'inf'}],
+            [{'best_effort_timestamp_time': '0.1'}, {'best_effort_timestamp_time': '0.0'}],
+        ]
+        for decoded in invalid_frames:
+            with self.subTest(decoded=decoded), \
+                    mock.patch.object(frames, 'find_tool', return_value='ffprobe'), \
+                    mock.patch.object(frames.subprocess, 'run', side_effect=[
+                        SimpleNamespace(stdout='N/A,K_\n'),
+                        SimpleNamespace(stdout=json.dumps({'frames': decoded})),
+                    ]), self.assertWarns(RuntimeWarning), self.assertRaisesRegex(
+                        RuntimeError, 'video.avi: decoded'):
+                frames.probe_frame_timestamps(Path('video.avi'))
+
+    def test_probe_failure_is_not_replaced_by_a_timestamp_fallback(self):
+        error = frames.subprocess.CalledProcessError(1, ['ffprobe'])
+        with mock.patch.object(frames, 'find_tool', return_value='ffprobe'), \
+                mock.patch.object(frames.subprocess, 'run', side_effect=error) as run, \
+                self.assertRaises(frames.subprocess.CalledProcessError):
+            frames.probe_frame_timestamps(Path('video.avi'))
+        run.assert_called_once()
+
+    def test_source_plan_records_timestamp_provenance_and_keeps_all_20fps_frames(self):
+        decoded = {'frames': [{'best_effort_timestamp_time': str(t)} for t in (0.0, 0.05, 0.1)]}
+        info = {'avg_frame_rate': 20.0, 'r_frame_rate': 20.0, 'pix_fmt': 'yuv420p'}
+        for fallback in (False, True):
+            replies = [SimpleNamespace(stdout='0.000000,K_\n0.050000,__\n0.100000,__\n')]
+            if fallback:
+                replies = [SimpleNamespace(stdout='N/A,K_\n'), SimpleNamespace(stdout=json.dumps(decoded))]
+            with self.subTest(fallback=fallback), \
+                    mock.patch.object(frames, 'probe_video', return_value=info), \
+                    mock.patch.object(frames, 'find_tool', return_value='ffprobe'), \
+                    mock.patch.object(frames.subprocess, 'run', side_effect=replies), \
+                    mock.patch.object(frames.warnings, 'warn') as warn:
+                plan = frames.SourcePlan('video', Path('video.avi'))
+                expected = ('decoded frames (ffprobe best-effort timestamps)' if fallback
+                            else 'container packets (ffprobe)')
+                self.assertEqual(plan.timestamp_source, expected)
+                np.testing.assert_array_equal(plan.timestamps, [0.0, 0.05, 0.1])
+                np.testing.assert_array_equal(plan.selection['indices'], [0, 1, 2])
+                self.assertEqual(plan.selection['mode'], 'all')
+                self.assertEqual(plan.selection['effective_fps'], 20.0)
+                self.assertEqual(warn.call_count, int(fallback))
 
 
 class ImageTimestampTests(unittest.TestCase):

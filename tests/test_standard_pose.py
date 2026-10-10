@@ -1,10 +1,12 @@
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault('MKL_THREADING_LAYER', 'SEQUENTIAL')
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -15,6 +17,92 @@ from vhrm_studio.mesh import SmplxMesh
 import h5py
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+
+
+class VideoDependencyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.qt = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_import_failure_is_preserved_and_reported_at_startup(self):
+        for exception in ("ModuleNotFoundError('No module named av', name='av')",
+                          "ImportError('DLL load failed: Application Control policy blocked pyio')"):
+            code = f"""
+import builtins
+original_import = builtins.__import__
+error = {exception}
+def guarded_import(name, *args, **kwargs):
+    if name == 'av':
+        raise error
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+from vhrm_studio import app
+assert app.av is None
+assert app._AV_IMPORT_ERROR is error
+assert str(error) in app._pyav_error_message()
+"""
+            with self.subTest(exception=exception):
+                result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                                        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1]
+                                                                          / 'src')})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('RuntimeWarning:', result.stderr)
+                self.assertIn('Restart the viewer', result.stderr)
+
+    def test_missing_package_identifies_the_interpreter_and_install_command(self):
+        error = ModuleNotFoundError("No module named 'av'", name='av')
+        with mock.patch.object(app, 'av', None), mock.patch.object(app, '_AV_IMPORT_ERROR', error):
+            message = app._pyav_error_message()
+            self.assertIn('PyAV is not installed', message)
+            self.assertIn(sys.executable, message)
+            self.assertIn('-m pip install av', message)
+            with self.assertRaises(RuntimeError) as raised:
+                app.VideoSource(Path('source.avi'), {})
+            self.assertIs(raised.exception.__cause__, error)
+
+    def test_native_import_failure_is_not_reported_as_a_missing_package(self):
+        error = ImportError('DLL load failed: Application Control policy blocked pyio')
+        with mock.patch.object(app, 'av', None), mock.patch.object(app, '_AV_IMPORT_ERROR', error):
+            message = app._pyav_error_message()
+        self.assertIn('PyAV could not be imported', message)
+        self.assertNotIn('PyAV is not installed', message)
+        self.assertIn(str(error), message)
+        self.assertIn('administrator-approved package', message)
+        self.assertIn(sys.executable, message)
+
+    def test_source_video_session_reports_the_original_import_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'source_skin_uv.h5'
+            video = root / 'source.avi'
+            video.touch()
+
+            def write():
+                with h5py.File(path, 'w') as file:
+                    file.attrs['texture_size'] = 8
+                    file.create_dataset('frame_status', data=np.array([1], np.uint8))
+
+            app.h5call(write)
+            error = ImportError('DLL load failed: signing policy blocked PyAV')
+            with mock.patch.object(app, 'av', None), mock.patch.object(app, '_AV_IMPORT_ERROR', error):
+                session = app.Session(path, SimpleNamespace(), video_override=video)
+                try:
+                    self.assertIsNone(session.video)
+                    self.assertIn(str(error), session.video_error)
+                    self.assertIn('PyAV could not be imported', session.video_error)
+                finally:
+                    session.close()
+
+    def test_mp4_export_warns_before_using_the_existing_opencv_fallback(self):
+        error = ImportError('DLL load failed while importing pyio')
+        with mock.patch.object(app, 'av', None), mock.patch.object(app, '_AV_IMPORT_ERROR', error), \
+                mock.patch.object(app.cv2, 'VideoWriter') as video_writer, \
+                self.assertWarnsRegex(RuntimeWarning, 'OpenCV mp4v fallback'):
+            writer = app.Mp4Writer(Path('output.mp4'), 20.0, 32, 32)
+            self.assertIs(writer.cv, video_writer.return_value)
+            self.assertEqual(writer.codec, 'opencv mp4v')
+            writer.close()
+        video_writer.return_value.release.assert_called_once()
 
 
 class PackedUVTests(unittest.TestCase):

@@ -4,7 +4,8 @@ opencv-python>=4.7
 # 6.10.x fails to import in the vHRM_PEAR conda env (its bundled MSVC runtime 14.44 is too old for Qt 6.10).
 PySide6>=6.5,<6.10
 pyqtgraph>=0.13.3
-# Source-video panels and MP4 export.
+# Source-video panels and MP4 export. Verify "import av" in the launch interpreter after installation:
+# package metadata alone does not detect native DLL or Windows Application Control failures (see README).
 av>=11
 
 # This file installs the viewer only. The dataset conversion and the SMPL-X mesh views need

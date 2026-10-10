@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -85,19 +86,41 @@ def probe_video(path, ffmpeg_dir=None):
 def probe_frame_timestamps(path, ffmpeg_dir=None):
     """Presentation timestamps (s) of every decodable frame, in decoder output order.
 
-    Demux only (fast). Packets flagged D (discarded by the edit list) are never output by the decoder."""
+    Demux only when packet PTS are available; otherwise probe decoded-frame best-effort timestamps.
+    Packets flagged D (discarded by the edit list) are never output by the decoder."""
+    return _probe_frame_timestamps(path, ffmpeg_dir)[0]
+
+
+def _probe_frame_timestamps(path, ffmpeg_dir=None):
     cmd = [find_tool('ffprobe', ffmpeg_dir), '-v', 'error', '-select_streams', 'v:0', '-show_entries',
            'packet=pts_time,flags', '-of', 'csv=p=0', str(path)]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_NO_WINDOW).stdout
     timestamps = []
     for line in out.splitlines():
-        pts, _, flags = line.strip().partition(',')
-        if not pts or 'D' in flags:
+        if not line.strip():
             continue
-        if pts == 'N/A':
-            raise RuntimeError(f'{path}: packet without a presentation timestamp')
+        pts, _, flags = line.strip().partition(',')
+        if 'D' in flags:
+            continue
+        if not pts or pts == 'N/A':
+            warnings.warn(f'{path}: packet presentation timestamps are missing; probing decoded-frame '
+                          'best-effort timestamps instead (slower).', RuntimeWarning, stacklevel=2)
+            cmd = [find_tool('ffprobe', ffmpeg_dir), '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                   'frame=best_effort_timestamp_time', '-of', 'json', str(path)]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=_NO_WINDOW).stdout
+            decoded = json.loads(out).get('frames', [])
+            timestamps = []
+            for index, frame in enumerate(decoded):
+                timestamp = frame.get('best_effort_timestamp_time')
+                if not timestamp or timestamp == 'N/A':
+                    raise RuntimeError(f'{path}: decoded frame {index} without a presentation timestamp')
+                timestamps.append(float(timestamp))
+            timestamps = np.asarray(timestamps, dtype=np.float64)
+            if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) < 0):
+                raise RuntimeError(f'{path}: decoded-frame timestamps are not finite or not in presentation order')
+            return timestamps, 'decoded frames (ffprobe best-effort timestamps)'
         timestamps.append(float(pts))
-    return np.sort(np.asarray(timestamps, dtype=np.float64))
+    return np.sort(np.asarray(timestamps, dtype=np.float64)), 'container packets (ffprobe)'
 
 
 def select_frames(timestamps, source_fps, target_fps=TARGET_FPS):
@@ -216,10 +239,9 @@ class SourcePlan:
         else:
             self.files = None
             self.info = probe_video(self.path, ffmpeg_dir)
-            self.timestamps = probe_frame_timestamps(self.path, ffmpeg_dir)
+            self.timestamps, self.timestamp_source = _probe_frame_timestamps(self.path, ffmpeg_dir)
             if not len(self.timestamps):
                 raise RuntimeError(f'{self.path}: no decodable frames')
-            self.timestamp_source = 'container packets (ffprobe)'
             measured = _measured_fps(self.timestamps)
             source_fps = self.info['avg_frame_rate'] or measured or self.info['r_frame_rate']
             self.decode_format = 'rgb24' if RGB_PIXEL_FORMATS.match(self.info['pix_fmt'] or '') else 'nv12'
