@@ -16,6 +16,7 @@ RASTER_BIN_SIZE = 32
 FOCAL_LENGTH = 24.0
 PERSON_MERGE_PX = 12       # DeepLab pixels bridged when joining the parts of one person (arms, hair, ...)
 PERSON_MIN_PIXELS = 1000   # smaller blobs count as no person (-> YOLO re-detection)
+PERSON_FRAGMENT_MIN_FRACTION = 0.005  # person pixels in components below this fraction of the largest are ignored
 _PERSON_MERGE_KERNEL = np.ones((2 * PERSON_MERGE_PX + 1,) * 2, dtype=np.uint8)
 
 
@@ -387,8 +388,16 @@ def pack_mask_bits(mask):
 
 
 def bbox_from_class_ids(class_ids, crop_to_frame, img_w, img_h, pad):
-    """Frame-space xywh of the largest person blob (non-background CIHP pixels) of one skin crop, or None."""
+    """Frame-space xywh of the largest person blob (non-background CIHP pixels) of one skin crop, or None.
+
+    Specks of a few false-positive pixels near the person (e.g. above the hair) would be merged into the blob and
+    stretch the box, so components smaller than PERSON_FRAGMENT_MIN_FRACTION of the largest one are dropped first."""
     person = (class_ids > 0).astype(np.uint8)
+    n_parts, parts, stats, _ = cv2.connectedComponentsWithStats(person, connectivity=8)
+    if n_parts > 2:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep = np.r_[False, areas >= PERSON_FRAGMENT_MIN_FRACTION * areas.max()]
+        person = keep[parts].astype(np.uint8)
     n_labels, labels = cv2.connectedComponents(cv2.dilate(person, _PERSON_MERGE_KERNEL), connectivity=8)
     counts = np.bincount(labels[person > 0], minlength=n_labels)
     best = int(counts.argmax())

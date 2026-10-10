@@ -273,7 +273,8 @@ class SkinUVPipeline:
             diagnostic = {}
             if frame_times is not None:
                 with timer('temporal_parameters'):
-                    outputs, diagnostic = temporal.stabilize_model_outputs(outputs, frame_times)
+                    outputs, diagnostic = temporal.stabilize_model_outputs(
+                        outputs, frame_times, temporal.crop_camera(pear_inv, CROP_SIZE, FOCAL_LENGTH, device))
             with timer('smplx'):
                 verts = ehm(outputs['body_param'], outputs['flame_param'], pose_type='aa')['vertices']
             with timer('uv_geometry'):

@@ -3,6 +3,7 @@
 # Temporal stabilization (notebook cell 12): tunable starting values, not a calibrated rPPG setting.
 TEMPORAL_CONFIG = {
     'bbox_enabled': True, 'bbox_alpha': 0.0,
+    'bbox_deadband': 0.03,          # a still person keeps a still crop (fraction of the box size / log-size)
     'shape_enabled': True, 'shape_alpha': 0.99, 'shape_reference_fps': 30.0, 'shape_warmup_frames': 0,
     'camera_enabled': True, 'pose_enabled': True,
     'camera_d_cutoff': 1.0, 'pose_d_cutoff': 1.0,

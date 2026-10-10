@@ -1,5 +1,12 @@
-"""One Euro / EMA temporal stabilization of the PEAR parameters (temporal_stabilization.py of the skin-UV pipeline,
-unchanged)."""
+"""One Euro / EMA temporal stabilization of the PEAR parameters (temporal_stabilization.py of the skin-UV pipeline),
+with two additions:
+
+* the camera translation is filtered in a fixed reference camera instead of the crop camera. PEAR predicts it
+  relative to the crop, so every crop move is a step of the raw translation that exactly compensates the move; a
+  low-pass filter on crop-relative values lags behind that step and drags the mesh along with the crop (~70% of the
+  move, decaying over ~6 frames). Re-expressed in a crop-independent camera, a crop move is no motion at all.
+* the bbox filter has a dead band, so that a still person keeps a still crop (the crop is re-estimated from the
+  segmentation of the crop itself, a feedback loop that can otherwise oscillate between two crops)."""
 import math
 
 import numpy as np
@@ -63,14 +70,20 @@ class OneEuroFilterTensor:
 
 
 class BBoxTemporalFilter:
-    """EMA of center and log-size on the existing four-value CPU bbox path, without extra padding."""
+    """EMA of center and log-size on the existing four-value CPU bbox path, without extra padding.
 
-    def __init__(self, enabled=True, alpha=0.65, nominal_interval=8 / 30):
+    deadband: the box stays put while the center moves by less than this fraction of the box size and the log-size
+    by less than this value; larger changes are filtered as usual (0 disables the dead band)."""
+
+    def __init__(self, enabled=True, alpha=0.65, nominal_interval=8 / 30, deadband=0.0):
         if not 0.0 <= alpha <= 1.0:
             raise ValueError('bbox alpha must be in [0, 1]')
+        if deadband < 0:
+            raise ValueError('bbox deadband must be nonnegative')
         self.enabled = enabled
         self.alpha = alpha
         self.nominal_interval = nominal_interval
+        self.deadband = deadband
         self.reset()
 
     def reset(self):
@@ -87,6 +100,9 @@ class BBoxTemporalFilter:
         if raw is not None:
             if self.state is None or not self.enabled:
                 self.state = raw.copy()
+            elif (np.abs(raw[:2] - self.state[:2]) < self.deadband * np.exp(self.state[2:])).all() and \
+                    (np.abs(raw[2:] - self.state[2:]) < self.deadband).all():
+                pass
             else:
                 dt = max(float(timestamp) - self.previous_timestamp, 1e-6)
                 retention = self.alpha ** (dt / self.nominal_interval)
@@ -130,13 +146,15 @@ class TemporalParameterStabilizer:
             raise ValueError('minimum cutoffs must be positive and beta must be nonnegative')
         self.config = dict(config)
         self.fps = float(fps)
-        self.bbox_filter = BBoxTemporalFilter(config['bbox_enabled'], config['bbox_alpha'], batch_size / fps)
+        self.bbox_filter = BBoxTemporalFilter(config['bbox_enabled'], config['bbox_alpha'], batch_size / fps,
+                                              config.get('bbox_deadband', 0.0))
         self.reset_temporal_state()
 
     def reset_temporal_state(self):
         self.bbox_filter.reset()
         self.previous_timestamp = None
         self.linear_filter = self.rotation_filter = None
+        self.camera_reference = None
         self.shape_estimate = None
         self.shape_count = 0
         self.previous_diagnostics = {}
@@ -144,6 +162,25 @@ class TemporalParameterStabilizer:
 
     def stabilize_bbox(self, bbox, width, height, timestamp):
         return self.bbox_filter.update(bbox, width, height, timestamp)
+
+    @staticmethod
+    def crop_camera(crop_to_frame, crop_size, focal_length, device):
+        """Frame-pixel principal point and focal lengths (2,) of PEAR's camera for an axis-aligned crop whose pixels
+        map to frame pixels by crop_to_frame (2, 3): NDC xy projects to crop pixel (1 - ndc) * crop_size / 2."""
+        affine = torch.as_tensor(np.asarray(crop_to_frame, dtype=np.float64)[:, :2], dtype=torch.float32,
+                                 device=device)
+        shift = torch.as_tensor(np.asarray(crop_to_frame, dtype=np.float64)[:, 2], dtype=torch.float32, device=device)
+        half = 0.5 * crop_size
+        return affine.sum(1) * half + shift, affine.diagonal() * (focal_length * half)
+
+    @staticmethod
+    def _change_camera(translation, source, target):
+        """Translations (n, 3) of the camera `source` re-expressed in the camera `target` (both (center, focal)):
+        the model origin keeps its frame-pixel projection and its projected size."""
+        (source_center, source_focal), (target_center, target_focal) = source, target
+        pixel = source_center - source_focal * translation[:, :2] / translation[:, 2:]
+        depth = translation[:, 2:] * (target_focal.mean() / source_focal.mean())
+        return torch.cat([depth * (target_center - pixel) / target_focal, depth], dim=1)
 
     def _coefficients(self, values, specs):
         cutoff, beta, derivative_cutoff = [], [], []
@@ -172,7 +209,10 @@ class TemporalParameterStabilizer:
         self.previous_diagnostics[name] = (raw[-1].clone(), filtered[-1].clone())
         return dict(changes)
 
-    def stabilize_model_outputs(self, outputs, timestamps):
+    def stabilize_model_outputs(self, outputs, timestamps, crop_camera=None):
+        """crop_camera: (center, focal) of the batch's crop (see crop_camera()). When given, the camera translation
+        is filtered in the camera of the first crop since the last reset, so that crop moves are not filtered as
+        motion; without it, the translation is filtered relative to the crop."""
         config = self.config
         result = {**outputs, 'body_param': dict(outputs['body_param']), 'flame_param': dict(outputs['flame_param'])}
         camera = outputs['pd_cam']
@@ -192,8 +232,13 @@ class TemporalParameterStabilizer:
                     static_specs.append((group, key, value.shape, value[0].numel()))
                     static_values.append(value.reshape(count, -1))
         if config['camera_enabled']:
+            translation = camera[:, :3, 3]
+            if crop_camera is not None:
+                if self.camera_reference is None:
+                    self.camera_reference = crop_camera
+                translation = self._change_camera(translation, crop_camera, self.camera_reference)
             linear_specs.append(('pd_cam', None, (count, 3), 3))
-            linear_values.append(camera[:, :3, 3])
+            linear_values.append(translation)
             profiles.append('camera')
         if config['pose_enabled'] or diagnostics:
             for group, key, representation, profile in self.ROTATION_KEYS:
@@ -252,7 +297,8 @@ class TemporalParameterStabilizer:
                 value = packed[:, offset:offset + length].reshape(shape)
                 if group == 'pd_cam':
                     result['pd_cam'] = camera.clone()
-                    result['pd_cam'][:, :3, 3] = value
+                    result['pd_cam'][:, :3, 3] = (value if crop_camera is None else
+                                                  self._change_camera(value, self.camera_reference, crop_camera))
                 else:
                     result[group][key] = value
                 offset += length
