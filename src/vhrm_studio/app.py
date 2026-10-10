@@ -75,6 +75,10 @@ DEFAULT_COLORMAP = np.array([
 ], dtype=np.uint8)
 SKIN_REGIONS = {'All skin': (10, 13, 14, 15, 16, 17), 'Face': (13,), 'Torso': (10,), 'Arms': (14, 15),
                 'Legs': (16, 17)}
+# SMPL-X face ids (inclusive ranges) of the two eyeball meshes, vertices 9383-10474: the four circular UV islands.
+# Inside the head or behind the eyelids, so left out of the plots unless asked for.
+SMPLX_EYEBALL_FACES = ((9424, 10575), (19884, 20907))
+SMPLX_N_FACES = 20908
 POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1).astype(np.int64)
 UV_EMPTY_LEVEL = 32       # grey of body texels without data when the UV silhouette is on
 MESH_RASTER_SIZE = 768
@@ -374,6 +378,21 @@ class SkinUVFile:
                                      for name in ('texel_fids', 'texel_bary'))
             return self._texels
 
+    def eyeball_texels(self):
+        """(S, S) bool: UV texels on the SMPL-X eyeballs, from texel_fids. None when the file cannot tell."""
+        try:
+            fids = self.texel_tables()[0].reshape(-1)
+        except Unavailable:
+            return None
+        if fids.size != self.uv_body.sum() or fids.max() >= SMPLX_N_FACES:
+            return None
+        eye = np.zeros(fids.shape, dtype=bool)
+        for first, last in SMPLX_EYEBALL_FACES:
+            eye |= (fids >= first) & (fids <= last)
+        mask = np.zeros(self.uv_body.shape, dtype=bool)
+        mask[self.uv_body] = eye  # texel order = np.flatnonzero(uv_body_mask)
+        return mask
+
     def accumulated_final(self):
         with self._lock:
             if self._final is None:
@@ -652,16 +671,18 @@ class UVAccumulator:
 class StatsWorker(threading.Thread):
     """Per-row statistics for the plots. Pass 1 (automatic): skin / visible texel and crop skin pixel counts from
     the packed masks, then the accumulator checkpoints. Pass 2 (on request): mean UV skin colour per CIHP skin
-    region."""
+    region. The eyeball texels are counted apart so that the plots can include them or not."""
 
     def __init__(self, src, accum=None):
         super().__init__(daemon=True, name='stats')
         self.src, self.accum = src, accum
         n = src.n_rows
         self.counts = {k: np.full(n, np.nan) for k in ('uv_skin', 'uv_visible', 'crop_skin')}
+        self.eye_counts = {k: np.zeros(n) for k in ('uv_skin', 'uv_visible')}
         self.body_texels = int(src.uv_body.sum()) if src.uv_body is not None else src.texture_size ** 2
-        self.colour = np.full((n, len(SKIN_REGIONS), 3), np.nan)
-        self.colour_texels = np.zeros((n, len(SKIN_REGIONS)))
+        self.eye_texels = 0
+        self.colour_sums = np.zeros((n, 2, len(SKIN_REGIONS), 3))  # axis 1: [not eyeballs, eyeballs]
+        self.colour_texels = np.zeros((n, 2, len(SKIN_REGIONS)))
         self.done = [0, 0]
         self.want_colour = threading.Event()
         self.stop_event = threading.Event()
@@ -673,12 +694,19 @@ class StatsWorker(threading.Thread):
             names = {'uv_skin': 'uv_skin_mask_packed', 'uv_visible': 'uv_visible_mask_packed',
                      'crop_skin': 'crop_skin_mask_packed'}
             names = {k: v for k, v in names.items() if v in src._ds}
+            eye = src.eyeball_texels() if src.uv_body is not None else None
+            if eye is not None:
+                eye_packed = np.packbits(eye, axis=-1)
+                self.eye_texels = int(eye.sum())
             for r in range(src.n_rows):
                 if self.stop_event.is_set():
                     return
                 if src.ok(r):
                     for key, name in names.items():
-                        self.counts[key][r] = POPCOUNT[src.read_raw(name, r)].sum()
+                        raw = src.read_raw(name, r)
+                        if eye is not None and key in self.eye_counts:
+                            self.eye_counts[key][r] = POPCOUNT[raw & eye_packed].sum()
+                        self.counts[key][r] = POPCOUNT[raw].sum()
                 self.done[0] = r + 1
             if self.accum is not None and src.has('uv_skin_mask') and src.has('uv_skin_rgb'):
                 self.accum.prefill(self.stop_event)
@@ -693,19 +721,33 @@ class StatsWorker(threading.Thread):
                     return
                 if src.ok(r):
                     skin = src.read('uv_skin_mask', r)
-                    ids = src.read('uv_class_ids', r)[skin]
-                    rgb = src.read('uv_skin_rgb', r)[skin].astype(np.float64)
-                    count = np.bincount(ids, minlength=256)
-                    sums = np.stack([np.bincount(ids, weights=rgb[:, c], minlength=256) for c in range(3)], 1)
-                    for j, cls in enumerate(regions):
-                        c = count[cls].sum()
-                        self.colour_texels[r, j] = c
-                        if c > 0:
-                            self.colour[r, j] = sums[cls].sum(0) / c
+                    ids_all, rgb_all = src.read('uv_class_ids', r), src.read('uv_skin_rgb', r)
+                    for part, sel in enumerate((skin,) if eye is None else (skin & ~eye, skin & eye)):
+                        ids = ids_all[sel]
+                        rgb = rgb_all[sel].astype(np.float64)
+                        count = np.bincount(ids, minlength=256)
+                        sums = np.stack([np.bincount(ids, weights=rgb[:, c], minlength=256) for c in range(3)], 1)
+                        for j, cls in enumerate(regions):
+                            self.colour_sums[r, part, j] = sums[cls].sum(0)
+                            self.colour_texels[r, part, j] = count[cls].sum()
                 self.done[1] = r + 1
         except Exception as exc:
             self.error = exc
             traceback.print_exc()
+
+    def uv_coverage(self, key, eyes):
+        """Per-row fraction of body texels set in the UV mask `key` ('uv_skin' or 'uv_visible')."""
+        if eyes:
+            return self.counts[key] / self.body_texels
+        return (self.counts[key] - self.eye_counts[key]) / (self.body_texels - self.eye_texels)
+
+    def region_colour(self, j, eyes):
+        """Per-row mean UV skin colour (n, 3), NaN without texels, and skin texel count (n,) of region j."""
+        parts = slice(None) if eyes else slice(0, 1)
+        sums = self.colour_sums[:, parts, j].sum(1)
+        texels = self.colour_texels[:, parts, j].sum(1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return sums / texels[:, None], texels
 
 
 class MeshManager(QtCore.QObject):
@@ -2177,6 +2219,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_tabs = QtWidgets.QTabWidget()
         self.plot_tabs.addTab(self.timeline, 'Coverage timeline')
         self.plot_tabs.addTab(sig_widget, 'Colour signals')
+        self.eyes_check = QtWidgets.QCheckBox('Include eyeballs')
+        self.eyes_check.setToolTip('Count the SMPL-X eyeball texels (the four UV circles) in the UV coverage and '
+                                   'colour signals')
+        self.eyes_check.setChecked(self.settings.value('plots_include_eyeballs', False, type=bool))
+        self.eyes_check.toggled.connect(self._eyes_toggled)
+        self.plot_tabs.setCornerWidget(self.eyes_check)
         self.plots_dock = dock = QtWidgets.QDockWidget('Plots', self, objectName='plots_dock')
         dock.setWidget(self.plot_tabs)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
@@ -2612,6 +2660,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session.stats.want_colour.set()
             self.sig_button.setEnabled(False)
 
+    def _eyes_toggled(self, checked):
+        self.settings.setValue('plots_include_eyeballs', checked)
+        self._refresh_stats(force=True)
+
     def _refresh_stats(self, force=False):
         if self.session is None:
             return
@@ -2621,20 +2673,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._stats_seen = done
         t = src.timestamps - src.timestamps[0]
-        crop_px = src.crop_size ** 2
+        eyes = self.eyes_check.isChecked()
         for key, curve in self.tl_curves.items():
-            denom = crop_px if key == 'crop_skin' else stats.body_texels
-            curve.setData(t, 100.0 * stats.counts[key] / denom, connect='finite')
+            fraction = (stats.counts[key] / src.crop_size ** 2 if key == 'crop_skin'
+                        else stats.uv_coverage(key, eyes))
+            curve.setData(t, 100.0 * fraction, connect='finite')
         bad = np.flatnonzero(src.status != 1)
         self.tl_bad.setData(t[bad], np.zeros(len(bad)))
         j = self.region_combo.currentIndex()
         mode = self.sig_mode.currentIndex()
+        values, texels = stats.region_colour(j, eyes)
         if mode == 2:
             for c, curve in enumerate(self.sig_curves):
-                curve.setData(t, stats.colour_texels[:, j] if c == 1 else np.full_like(t, np.nan), connect='finite')
+                curve.setData(t, texels if c == 1 else np.full_like(t, np.nan), connect='finite')
             self.signals.setLabel('left', 'skin texels')
         else:
-            values = stats.colour[:, j, :]
             if mode == 1:
                 with np.errstate(invalid='ignore'):
                     values = values / np.nanmean(values, axis=0) - 1.0 if np.isfinite(values).any() else values
